@@ -16,7 +16,7 @@ from __future__ import annotations
 import csv
 import io
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Iterable
 
@@ -63,6 +63,18 @@ def _find_column(headers: list[str], candidates: Iterable[str]) -> int | None:
         if candidate in normalised:
             return normalised.index(candidate)
     return None
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def format_epoch_iso(epoch: int) -> str:
+    """Render epoch seconds as an ISO-8601 UTC timestamp (``...Z``)."""
+    return (
+        (_EPOCH + timedelta(seconds=int(epoch)))
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def _parse_time(value: str) -> int:

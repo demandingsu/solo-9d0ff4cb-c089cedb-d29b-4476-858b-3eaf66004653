@@ -2,6 +2,7 @@ import hashlib
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager, contextmanager
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Annotated, Iterator
 
@@ -12,7 +13,82 @@ from pydantic import BaseModel, Field, model_validator
 
 from . import __version__, csv_ingest, db, service
 from .config import Settings
+from .csv_ingest import MAX_EPOCH, MIN_EPOCH, format_epoch_iso
 from .errors import AppError
+
+
+def _parse_utc_timestamp(value: str) -> int:
+    """Parse an ISO-8601 timestamp for the seal APIs (no timezone means UTC).
+
+    Plain integers are accepted as epoch seconds for callers that already use
+    the numeric ``start_time``/``end_time`` representation.  Milliseconds are
+    rejected: the seal must name an unambiguous UTC instant.
+    """
+    text = value.strip()
+    if not text:
+        raise ValueError("empty timestamp")
+    if text.lstrip("-").isdigit():
+        epoch = int(text)
+        if not (MIN_EPOCH <= epoch <= MAX_EPOCH):
+            raise ValueError(f"timestamp out of range: {value!r}")
+        return epoch
+    normalised = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    try:
+        parsed = datetime.fromisoformat(normalised)
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid UTC timestamp {value!r}; use ISO-8601, e.g. 2026-01-01T00:00:00Z"
+        ) from exc
+    if parsed.microsecond:
+        raise ValueError("watermark must resolve to whole UTC seconds")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    epoch = int(parsed.timestamp())
+    if not (MIN_EPOCH <= epoch <= MAX_EPOCH):
+        raise ValueError(f"timestamp out of range: {value!r}")
+    return epoch
+
+
+class SealIn(BaseModel):
+    """Seal a UTC read watermark.  Supply one of the two equivalent fields."""
+
+    model_config = {"extra": "forbid"}
+
+    watermark: str | int | None = Field(
+        default=None,
+        description=(
+            "UTC 结束水位：ISO-8601（如 2026-01-01T12:00:00Z）或 epoch 秒"
+        ),
+        examples=["2026-01-01T12:00:00Z"],
+    )
+    watermark_time: str | int | None = Field(
+        default=None,
+        description="`watermark` 的别名，便于调用方按需选择字段名",
+        examples=["2026-01-01T12:00:00Z"],
+    )
+
+    @model_validator(mode="after")
+    def _resolve(self) -> "SealIn":
+        values = [
+            str(value).strip()
+            for value in (self.watermark, self.watermark_time)
+            if value is not None and str(value).strip()
+        ]
+        if not values:
+            raise ValueError("provide watermark (UTC ISO-8601 or epoch seconds)")
+        if len(set(values)) > 1:
+            raise ValueError("watermark and watermark_time disagree")
+        return self
+
+    def epoch(self) -> int:
+        raw = str(
+            next(
+                value
+                for value in (self.watermark, self.watermark_time)
+                if value is not None and str(value).strip()
+            )
+        ).strip()
+        return _parse_utc_timestamp(raw)
 
 
 class PortIn(BaseModel):
@@ -79,16 +155,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "- 停留首末相距 ≥ 30 分钟才形成事件。\n"
             "- 迟到点改变事件时，未变事件保留 event_id；被改变事件按旧号撤回"
             "（retract），新事件以新号加入（upsert）。变更按 `seq` 游标顺序读取。\n"
-            "- 每次上传的原始点、现役事件、变更记录在同一个 SQLite 写事务中提交。\n\n"
+            "- 每次上传的原始点、现役事件、变更记录在同一个 SQLite 写事务中提交。\n"
+            "- 可封存 UTC 结束水位：只交付 `end_time <= watermark` 的事件并返回"
+            "封存时的游标；水位只前进，已封存事件不再延长、撤回或换号。\n\n"
             "**在 /docs 演示迟到补点与撤回**：展开 `POST /demo/run`，点击 "
             "Try it out -> Execute。响应内含修改前后事件、retract/upsert 变更"
-            "及保留编号的事件，可直接观察。"
+            "及保留编号的事件，可直接观察。\n\n"
+            "**在 /docs 演示封存与续读**：展开 `POST /demo/seal/run` 执行一次，"
+            "响应给出封存水位、已封存事件、续读游标，以及封存后补点的拒收结果。"
         ),
         openapi_tags=[
             {"name": "ports", "description": "港区矩形范围登记"},
             {"name": "uploads", "description": "CSV 点位上传（原子、幂等）"},
             {"name": "events", "description": "当前现役靠港停留事件"},
             {"name": "changes", "description": "按游标顺序读取的事件变更流"},
+            {"name": "seals", "description": "UTC 结束水位封存与已封存事件分页"},
             {"name": "demo", "description": "迟到补点与撤回演示"},
             {"name": "system", "description": "健康检查"},
         ],
@@ -348,6 +429,132 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 conn, port_code=port_code, after=after, limit=limit
             )
 
+    @app.post(
+        "/ports/{port_code}/seals",
+        tags=["seals"],
+        status_code=201,
+        summary="封存 UTC 结束水位（水位只前进，重复封存幂等）",
+        description=(
+            "封存一个 UTC 结束水位 `watermark`（ISO-8601，如 "
+            "`2026-01-01T12:00:00Z`；也接受字段名 `watermark_time`）。\n\n"
+            "**语义**\n"
+            "- 交付口径：`end_time <= watermark` 的事件。响应返回 `seal`"
+            "（含 `changes_cursor`）与 `frozen_event_count`。\n"
+            "- 封存后仍可上传较新的观测；但任何时间 `<= watermark + 600s` "
+            "的点都会使整批被拒（409 `point_at_or_before_watermark`）。\n"
+            "- 已封存事件不会被延长、撤回或换号；越界批次整体回滚。\n"
+            "- 水位只能前进：相同水位返回 200 与原封存；更低水位不生效，"
+            "返回当前最新封存（`ignored=true`）。\n"
+            "- 封存、事件、游标取自同一个 `BEGIN IMMEDIATE` 提交状态。\n\n"
+            "**继续读取**：`GET /ports/{code}/seals/{seal_id}/events` 分页读取"
+            "已封存事件；保存 `seal.changes_cursor` 后用 "
+            "`/changes?after=<cursor>` 增量读取。响应中的 `resume` 给出两个"
+            "可直接使用的地址。"
+        ),
+        responses={
+            201: {"description": "新水位已封存"},
+            200: {"description": "水位未前进，返回既有封存（幂等）"},
+            404: {"description": "港区未登记"},
+            422: {"description": "水位格式或范围无效"},
+        },
+    )
+    def create_seal(port_code: str, body: SealIn, conn: Db) -> JSONResponse:
+        try:
+            watermark = body.epoch()
+        except ValueError as exc:
+            raise AppError(422, "invalid_watermark", str(exc)) from exc
+        seal, created = service.seal_port(
+            conn, port_code=port_code, watermark=watermark
+        )
+        payload = service.seal_response(conn, port_code=port_code, seal=seal)
+        payload.update(
+            {
+                "created": created,
+                "advanced": created,
+                "requested_watermark": watermark,
+                "requested_watermark_iso": format_epoch_iso(watermark),
+                # A backwards request is accepted but does not move or replace
+                # the watermark; the newest existing seal is returned.
+                "ignored": (not created) and watermark != seal.watermark,
+            }
+        )
+        return JSONResponse(status_code=201 if created else 200, content=payload)
+
+    @app.get(
+        "/ports/{port_code}/seals",
+        tags=["seals"],
+        summary="列出已封存水位（紧接上一次封存之后的增量可用它续读）",
+        description=(
+            "按水位升序返回该港区全部封存记录。每条含 `changes_cursor`，"
+            "用 `/changes?after=<cursor>` 读取该封存之后的增量。"
+        ),
+    )
+    def read_seals(port_code: str, conn: Db) -> dict:
+        with db.read_snapshot(conn):
+            port = service.get_port(conn, port_code)
+            seals = service.list_seals(conn, port_code=port_code)
+            latest = service.latest_seal(conn, port_id=port.id)
+        return {
+            "port_id": port.id,
+            "count": len(seals),
+            "latest": None if latest is None else latest.as_dict(),
+            "seals": [seal.as_dict() for seal in seals],
+        }
+
+    @app.get(
+        "/ports/{port_code}/seals/{seal_id}",
+        tags=["seals"],
+        summary="读取单个封存记录及其续读地址",
+    )
+    def read_seal(port_code: str, seal_id: int, conn: Db) -> dict:
+        with db.read_snapshot(conn):
+            seal = service.get_seal(conn, port_code=port_code, seal_id=seal_id)
+            return service.seal_response(conn, port_code=port_code, seal=seal)
+
+    @app.get(
+        "/ports/{port_code}/seals/{seal_id}/events",
+        tags=["seals"],
+        summary="按已封存水位分页读取事件",
+        description=(
+            "只返回 `end_time <= seal.watermark` 的事件，按 `event_id` 升序分页"
+            "（`after_event_id` + `limit`）。`cursor` 即该封存的 "
+            "`changes_cursor`，与 `/changes?after=` 同源：保存它后继续读取"
+            "增量不会漏掉封存之后提交的变更。\n\n"
+            "`seal_id` 可写 `latest`，表示该港区当前最新封存水位。"
+        ),
+    )
+    def read_sealed_events(
+        port_code: str,
+        seal_id: str,
+        conn: Db,
+        after_event_id: int = Query(default=0, ge=0),
+        limit: int = Query(default=1000, ge=1, le=10000),
+    ) -> dict:
+        resolved_id: int | None
+        if seal_id.strip().lower() == "latest":
+            resolved_id = None
+        else:
+            try:
+                resolved_id = int(seal_id)
+            except ValueError as exc:
+                raise AppError(
+                    422,
+                    "invalid_seal_id",
+                    f"seal_id must be an integer or 'latest', got {seal_id!r}",
+                ) from exc
+            if resolved_id < 1:
+                raise AppError(
+                    422, "invalid_seal_id", "seal_id must be a positive integer"
+                )
+        with db.read_snapshot(conn):
+            return service.list_sealed_events(
+                conn,
+                port_code=port_code,
+                seal_id=resolved_id,
+                after_event_id=after_event_id,
+                limit=limit,
+            )
+
     if resolved.demo_enabled:
 
         @app.post(
@@ -368,6 +575,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             with db.write_transaction(conn):
                 return _run_demo(conn)
 
+        @app.post(
+            "/demo/seal/run",
+            tags=["demo"],
+            summary="演示封存水位、已封存事件分页与续读（可直接在 /docs 执行）",
+            description=(
+                "每次执行创建一个独立演示港区：上传基线事件后封存一个 UTC "
+                "结束水位，分页读取只含已封存事件的快照与游标；随后尝试上传"
+                "一个落在拒收带内的点位，展示整批 409 且游标不前进；最后展示"
+                "较新观测仍可上传、水位重复封存是幂等 no-op。"
+            ),
+        )
+        def run_seal_demo(conn: Db) -> dict:
+            with db.write_transaction(conn):
+                return _run_seal_demo(conn)
+
     return app
 
 
@@ -377,6 +599,153 @@ DEMO_PORT_BOUNDS = {
     "min_lon": 121.2,
     "max_lon": 121.8,
 }
+
+
+def _run_seal_demo(conn: sqlite3.Connection) -> dict:
+    """Seal a watermark, page the frozen snapshot, then show rejection/resume."""
+    port_code = "SEAL-" + uuid.uuid4().hex[:8].upper()
+    min_lat, max_lat, min_lon, max_lon = PortIn(
+        code=port_code, name="封存演示港区", **DEMO_PORT_BOUNDS
+    ).e6_bounds()
+    service.register_port(
+        conn,
+        code=port_code,
+        name="封存演示港区",
+        min_lat_e6=min_lat,
+        max_lat_e6=max_lat,
+        min_lon_e6=min_lon,
+        max_lon_e6=max_lon,
+    )
+
+    seed_rows = [
+        # Event A: 00:00 -> 01:00 (60 min), 10 minute spacing
+        ("SEAL-01", "2026-01-01T00:00:00Z", 31.20, 121.50),
+        ("SEAL-01", "2026-01-01T00:10:00Z", 31.201, 121.501),
+        ("SEAL-01", "2026-01-01T00:20:00Z", 31.202, 121.502),
+        ("SEAL-01", "2026-01-01T00:30:00Z", 31.203, 121.503),
+        ("SEAL-01", "2026-01-01T00:40:00Z", 31.204, 121.504),
+        ("SEAL-01", "2026-01-01T00:50:00Z", 31.205, 121.505),
+        ("SEAL-01", "2026-01-01T01:00:00Z", 31.206, 121.506),
+        # Event B: 01:20 -> 01:50 (30 min), ends after the watermark
+        ("SEAL-01", "2026-01-01T01:20:00Z", 31.21, 121.51),
+        ("SEAL-01", "2026-01-01T01:30:00Z", 31.211, 121.511),
+        ("SEAL-01", "2026-01-01T01:40:00Z", 31.212, 121.512),
+        ("SEAL-01", "2026-01-01T01:50:00Z", 31.213, 121.513),
+        # Event C: 00:05 -> 00:35 (30 min)
+        ("SEAL-02", "2026-01-01T00:05:00Z", 31.30, 121.60),
+        ("SEAL-02", "2026-01-01T00:15:00Z", 31.301, 121.601),
+        ("SEAL-02", "2026-01-01T00:25:00Z", 31.302, 121.602),
+        ("SEAL-02", "2026-01-01T00:35:00Z", 31.303, 121.603),
+    ]
+    seed_csv = _demo_csv(seed_rows)
+    parsed_seed = csv_ingest.parse_upload(seed_csv, max_rows=1000)
+    service.ingest(
+        conn,
+        port_code=port_code,
+        upload_key="seal-demo-seed-v1",
+        content=seed_csv,
+        rows=parsed_seed.rows,
+        rows_received=parsed_seed.rows_received,
+        in_file_duplicates=parsed_seed.in_file_duplicates,
+    )
+
+    watermark = _parse_utc_timestamp("2026-01-01T01:00:00Z")
+    seal, created = service.seal_port(
+        conn, port_code=port_code, watermark=watermark
+    )
+    sealed_page = service.list_sealed_events(
+        conn, port_code=port_code, seal_id=seal.id, limit=1000
+    )
+
+    # A batch with one point inside the rejected band must fail as a whole.
+    rejected_rows = [
+        ("SEAL-01", "2026-01-01T02:10:00Z", 31.20, 121.50),
+        ("SEAL-01", "2026-01-01T01:05:00Z", 31.20, 121.50),
+    ]
+    rejected_csv = _demo_csv(rejected_rows)
+    parsed_rejected = csv_ingest.parse_upload(rejected_csv, max_rows=1000)
+    conn.execute("SAVEPOINT seal_demo_reject")
+    try:
+        service.ingest(
+            conn,
+            port_code=port_code,
+            upload_key="seal-demo-rejected-v1",
+            content=rejected_csv,
+            rows=parsed_rejected.rows,
+            rows_received=parsed_rejected.rows_received,
+            in_file_duplicates=parsed_rejected.in_file_duplicates,
+        )
+        rejected_response: dict | None = None
+    except AppError as exc:
+        conn.execute("ROLLBACK TO seal_demo_reject")
+        rejected_response = {
+            "status_code": exc.status_code,
+            "code": exc.code,
+            "message": exc.message,
+            "details": exc.details,
+        }
+    finally:
+        conn.execute("RELEASE seal_demo_reject")
+
+    # Points above the cutoff are still accepted; event B (not sealed) grows.
+    newer_rows = [("SEAL-01", "2026-01-01T02:00:00Z", 31.214, 121.514)]
+    newer_csv = _demo_csv(newer_rows)
+    parsed_newer = csv_ingest.parse_upload(newer_csv, max_rows=1000)
+    newer_batch, _ = service.ingest(
+        conn,
+        port_code=port_code,
+        upload_key="seal-demo-newer-v1",
+        content=newer_csv,
+        rows=parsed_newer.rows,
+        rows_received=parsed_newer.rows_received,
+        in_file_duplicates=parsed_newer.in_file_duplicates,
+    )
+    changes_after_seal = service.list_changes(
+        conn,
+        port_code=port_code,
+        after=seal.changes_cursor,
+        limit=1000,
+    )
+    repeated, repeated_created = service.seal_port(
+        conn, port_code=port_code, watermark=watermark
+    )
+
+    return {
+        "demo_port": port_code,
+        "narrative": [
+            "1. 基线事件：SEAL-01 两个（00:00-01:00、01:20-01:50），"
+            "SEAL-02 一个（00:05-00:35）。",
+            "2. POST /ports/{code}/seals 封存 2026-01-01T01:00:00Z："
+            "只交付 end_time <= 01:00 的 SEAL-01 事件与 SEAL-02 事件，"
+            "响应含封存时的 changes_cursor。",
+            "3. 封存后尝试上传含 01:05:00 点的批次（拒收带为 "
+            "watermark + 600s = 01:10:00 以内）：整批 409，"
+            "游标与事件均不变。",
+            "4. 上传 02:10:00 的较新观测成功，只影响未封存的 SEAL-01 "
+            "第二个事件。",
+            "5. 重复封存同一水位返回 200，created=false，不产生新结果。",
+            "6. 保存 seal.changes_cursor 后调用 /changes?after=<cursor> "
+            "即可续读封存之后的增量。",
+        ],
+        "baseline_csv": seed_csv.decode("utf-8"),
+        "seal": service.seal_response(
+            conn, port_code=port_code, seal=seal
+        ),
+        "sealed_events_page": sealed_page,
+        "rejected_upload": {
+            "csv": rejected_csv.decode("utf-8"),
+            "response": rejected_response,
+        },
+        "newer_upload": {
+            "batch": newer_batch,
+            "changes_after_seal_cursor": changes_after_seal,
+        },
+        "repeat_seal": {
+            "created": repeated_created,
+            "same_seal_id": repeated.id == seal.id,
+            "changes_cursor": repeated.changes_cursor,
+        },
+    }
 
 
 def _demo_csv(rows: list[tuple[str, str, float, float]]) -> bytes:

@@ -15,7 +15,7 @@ import time
 from contextlib import contextmanager
 from typing import Iterator
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ports (
@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS ingest_batches (
     rows_new          INTEGER NOT NULL,
     rows_duplicate    INTEGER NOT NULL,
     rows_outside_port INTEGER NOT NULL,
+    latest_point_time INTEGER,
     received_at       TEXT    NOT NULL,
     UNIQUE (port_id, upload_key)
 );
@@ -84,6 +85,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_events_port_vessel_start
     ON events (port_id, vessel_id, start_time);
 CREATE INDEX IF NOT EXISTS idx_events_vessel
     ON events (vessel_id, start_time);
+CREATE INDEX IF NOT EXISTS idx_events_port_end_id
+    ON events (port_id, end_time, id);
 
 CREATE TABLE IF NOT EXISTS event_changes (
     seq          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,6 +107,21 @@ CREATE TABLE IF NOT EXISTS event_changes (
 
 CREATE INDEX IF NOT EXISTS idx_event_changes_port_seq
     ON event_changes (port_id, seq);
+
+CREATE TABLE IF NOT EXISTS seals (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    port_id        INTEGER NOT NULL REFERENCES ports(id),
+    watermark      INTEGER NOT NULL,
+    changes_cursor INTEGER NOT NULL,
+    event_count    INTEGER NOT NULL,
+    created_at     TEXT    NOT NULL,
+    UNIQUE (port_id, watermark),
+    CHECK (changes_cursor >= 0),
+    CHECK (event_count >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_seals_port_watermark
+    ON seals (port_id, watermark, id);
 
 CREATE TABLE IF NOT EXISTS schema_meta (
     key   TEXT PRIMARY KEY,
@@ -165,6 +183,7 @@ def initialise(db_path: str, *, busy_timeout_ms: int = 30_000) -> None:
         with write_transaction(conn):
             for statement in statements:
                 conn.execute(statement)
+            _migrate(conn)
             conn.execute(
                 "INSERT INTO schema_meta (key, value) VALUES ('version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -172,6 +191,24 @@ def initialise(db_path: str, *, busy_timeout_ms: int = 30_000) -> None:
             )
     finally:
         conn.close()
+
+
+def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Apply additive upgrades for databases created by an older version.
+
+    ``CREATE TABLE IF NOT EXISTS`` cannot add columns, so version 1 databases
+    need ``ingest_batches.latest_point_time`` explicitly.  Adding a nullable
+    column is an in-place, transactional operation; older rows simply have no
+    recorded point high-water mark.
+    """
+    if "latest_point_time" not in _column_names(conn, "ingest_batches"):
+        conn.execute(
+            "ALTER TABLE ingest_batches ADD COLUMN latest_point_time INTEGER"
+        )
 
 
 @contextmanager

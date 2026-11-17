@@ -13,6 +13,10 @@ Consistency contract
   changes.  The same ``upload_key`` with different content is rejected.
 * The change feed uses a monotonically increasing ``seq`` primary key as the
   cursor, so clients can page strictly forward and resume after restarts.
+* A port may have a *watermark* (seal).  Points at or before
+  ``watermark + LATE_POINT_GRACE_SECONDS`` are rejected in whole; events that
+  end at or before the watermark are frozen: later uploads may not extend,
+  retract, renumber or otherwise alter them.
 """
 
 from __future__ import annotations
@@ -25,9 +29,16 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Iterator
 
 from . import events as event_rules
-from .csv_ingest import RawPointRow
+from .csv_ingest import MAX_EPOCH as _MAX_EPOCH
+from .csv_ingest import MIN_EPOCH as _MIN_EPOCH
+from .csv_ingest import RawPointRow, format_epoch_iso
 from .db import write_transaction
 from .errors import AppError
+
+# Points at or before ``watermark + this`` are rejected after a seal.  Ten
+# minutes matches the maximum gap between two points of the same stay, so a
+# point inside that band could still join a sealed event.
+LATE_POINT_GRACE_SECONDS = 10 * 60
 
 
 def utc_now_iso() -> str:
@@ -172,6 +183,7 @@ def _batch_response(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
         "rows_new": row["rows_new"],
         "rows_duplicate": row["rows_duplicate"],
         "rows_outside_port": row["rows_outside_port"],
+        "latest_point_time": row["latest_point_time"],
         "event_changes": {
             "upserted": sum(1 for c in change_rows if c["change_type"] == "upsert"),
             "retracted": sum(
@@ -373,6 +385,303 @@ def _reconcile_vessel(
         )
 
 
+@dataclass(frozen=True)
+class Seal:
+    id: int
+    port_id: int
+    watermark: int
+    changes_cursor: int
+    event_count: int
+    created_at: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "seal_id": self.id,
+            "port_id": self.port_id,
+            "watermark": self.watermark,
+            "watermark_iso": format_epoch_iso(self.watermark),
+            "late_point_cutoff": self.watermark + LATE_POINT_GRACE_SECONDS,
+            "late_point_cutoff_iso": format_epoch_iso(
+                self.watermark + LATE_POINT_GRACE_SECONDS
+            ),
+            "changes_cursor": self.changes_cursor,
+            "event_count": self.event_count,
+            "created_at": self.created_at,
+        }
+
+
+def _seal_from_row(row: sqlite3.Row) -> Seal:
+    return Seal(
+        id=row["id"],
+        port_id=row["port_id"],
+        watermark=row["watermark"],
+        changes_cursor=row["changes_cursor"],
+        event_count=row["event_count"],
+        created_at=row["created_at"],
+    )
+
+
+def latest_seal(conn: sqlite3.Connection, *, port_id: int) -> Seal | None:
+    """The highest committed watermark for a port (``None`` if never sealed)."""
+    row = conn.execute(
+        """
+        SELECT * FROM seals
+        WHERE port_id = ?
+        ORDER BY watermark DESC, id DESC
+        LIMIT 1
+        """,
+        (port_id,),
+    ).fetchone()
+    return None if row is None else _seal_from_row(row)
+
+
+def get_seal(conn: sqlite3.Connection, *, port_code: str, seal_id: int) -> Seal:
+    port = get_port(conn, port_code)
+    row = conn.execute(
+        "SELECT * FROM seals WHERE id = ? AND port_id = ?",
+        (seal_id, port.id),
+    ).fetchone()
+    if row is None:
+        raise AppError(
+            404,
+            "seal_not_found",
+            f"seal {seal_id} does not exist for port {port_code!r}",
+        )
+    return _seal_from_row(row)
+
+
+def list_seals(conn: sqlite3.Connection, *, port_code: str) -> list[Seal]:
+    port = get_port(conn, port_code)
+    rows = conn.execute(
+        "SELECT * FROM seals WHERE port_id = ? ORDER BY watermark, id",
+        (port.id,),
+    ).fetchall()
+    return [_seal_from_row(row) for row in rows]
+
+
+def seal_response(
+    conn: sqlite3.Connection,
+    *,
+    port_code: str,
+    seal: Seal,
+) -> dict[str, Any]:
+    """Seal payload shared by the seal POST and the read endpoints.
+
+    ``event_count``/``frozen_event_count`` come from the seal row written in
+    the same transaction as ``changes_cursor``; they are never recomputed from
+    a later state, so a caller can rely on seal, delivered events and cursor
+    describing one committed instant.
+    """
+    return {
+        "seal": seal.as_dict(),
+        "frozen_event_count": seal.event_count,
+        "resume": {
+            "events": (
+                f"/ports/{port_code}/seals/{seal.id}/events"
+                "?after_event_id=0&limit=1000"
+            ),
+            "changes": f"/ports/{port_code}/changes?after={seal.changes_cursor}",
+        },
+    }
+
+
+def _check_sealed_points(
+    conn: sqlite3.Connection, *, port_id: int, watermark: int, rows: list[RawPointRow]
+) -> None:
+    """Reject the whole batch if any point falls at/before the cutoff."""
+    cutoff = watermark + LATE_POINT_GRACE_SECONDS
+    late = [row for row in rows if row.event_time <= cutoff]
+    if not late:
+        return
+    late.sort(key=lambda row: (row.event_time, row.vessel_id))
+    first = late[0]
+    raise AppError(
+        409,
+        "point_at_or_before_watermark",
+        (
+            "upload contains points at or before the sealed read watermark "
+            f"plus {LATE_POINT_GRACE_SECONDS} s; the whole batch was rejected"
+        ),
+        {
+            "watermark": watermark,
+            "cutoff": cutoff,
+            "cutoff_iso": format_epoch_iso(cutoff),
+            "rejected_points": len(late),
+            "first_rejected": {
+                "vessel": first.vessel_id,
+                "time": first.event_time,
+                "row": first.row_number,
+            },
+        },
+    )
+
+
+def _frozen_events(
+    conn: sqlite3.Connection,
+    *,
+    port_id: int,
+    watermark: int,
+    vessel_ids: Iterable[str] | None = None,
+) -> dict[int, tuple[Any, ...]]:
+    sql = "SELECT * FROM events WHERE port_id = ? AND end_time <= ?"
+    args: list[Any] = [port_id, watermark]
+    if vessel_ids is not None:
+        ids = list(vessel_ids)
+        if not ids:
+            return {}
+        sql += " AND vessel_id IN (" + ",".join("?" * len(ids)) + ")"
+        args.extend(ids)
+    rows = conn.execute(sql + " ORDER BY id", args).fetchall()
+    return {row["id"]: _event_identity(row) for row in rows}
+
+
+def _event_identity(row: sqlite3.Row) -> tuple[Any, ...]:
+    return (
+        row["vessel_id"],
+        row["start_time"],
+        row["end_time"],
+        row["start_lat_e6"],
+        row["start_lon_e6"],
+        row["end_lat_e6"],
+        row["end_lon_e6"],
+        row["point_count"],
+    )
+
+
+def _assert_frozen_events_unchanged(
+    conn: sqlite3.Connection,
+    *,
+    port_id: int,
+    watermark: int,
+    vessel_ids: Iterable[str],
+    before: dict[int, tuple[Any, ...]],
+) -> None:
+    """Fail the batch if reconciliation touched a sealed event.
+
+    Only vessels touched by this batch are reconciled, so only their sealed
+    events can possibly move.  With points at/before ``watermark + grace``
+    rejected this is a defensive invariant; raising rolls the batch back.
+    """
+    after = _frozen_events(
+        conn, port_id=port_id, watermark=watermark, vessel_ids=vessel_ids
+    )
+    if after != before:
+        raise AppError(
+            409,
+            "sealed_event_change_rejected",
+            (
+                "the batch would alter events sealed by the port watermark; "
+                "it was rejected as a whole"
+            ),
+            {"watermark": watermark},
+        )
+
+
+def seal_port(
+    conn: sqlite3.Connection,
+    *,
+    port_code: str,
+    watermark: int,
+) -> tuple[Seal, bool]:
+    """Seal a UTC read watermark for a port; returns (seal, replayed).
+
+    One ``BEGIN IMMEDIATE`` transaction reads the frozen event count and the
+    change cursor and writes the seal row, so the seal, the events it covers
+    and ``changes_cursor`` always describe the same committed state.  A
+    watermark that does not advance the newest seal is a no-op: the existing
+    seal (for an identical watermark) or the current newest seal (for an older
+    one) is returned without writing.
+    """
+    with _transaction_if_needed(conn):
+        port = get_port(conn, port_code)
+        if watermark > _MAX_EPOCH or watermark < _MIN_EPOCH:
+            raise AppError(
+                422,
+                "watermark_out_of_range",
+                f"watermark {watermark} is outside the supported range",
+            )
+        current = latest_seal(conn, port_id=port.id)
+        if current is not None and watermark <= current.watermark:
+            # Never move backwards and never mint a second result for the same
+            # watermark: both are idempotent no-ops.
+            return current, False
+
+        event_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM events WHERE port_id = ? AND end_time <= ?",
+            (port.id, watermark),
+        ).fetchone()["n"]
+        cursor = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS s FROM event_changes WHERE port_id = ?",
+            (port.id,),
+        ).fetchone()["s"]
+        created_at = utc_now_iso()
+        inserted = conn.execute(
+            """
+            INSERT INTO seals
+                (port_id, watermark, changes_cursor, event_count, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (port.id, watermark, int(cursor), int(event_count), created_at),
+        )
+        return (
+            Seal(
+                id=int(inserted.lastrowid),
+                port_id=port.id,
+                watermark=watermark,
+                changes_cursor=int(cursor),
+                event_count=int(event_count),
+                created_at=created_at,
+            ),
+            True,
+        )
+
+
+def list_sealed_events(
+    conn: sqlite3.Connection,
+    *,
+    port_code: str,
+    seal_id: int | None = None,
+    after_event_id: int = 0,
+    limit: int = 1000,
+) -> dict[str, Any]:
+    """Page the events that were frozen by a seal (``end_time <= watermark``).
+
+    Reads the seal and the page in one snapshot.  ``cursor`` is the seal's
+    ``changes_cursor``; pairing the page with ``/changes?after=<cursor>``
+    resumes the increment without a gap.
+    """
+    port = get_port(conn, port_code)
+    if seal_id is None:
+        seal = latest_seal(conn, port_id=port.id)
+        if seal is None:
+            raise AppError(
+                409,
+                "port_not_sealed",
+                f"port {port_code!r} has not been sealed yet",
+            )
+    else:
+        seal = get_seal(conn, port_code=port_code, seal_id=seal_id)
+
+    rows = conn.execute(
+        """
+        SELECT * FROM events
+        WHERE port_id = ? AND end_time <= ? AND id > ?
+        ORDER BY id
+        LIMIT ?
+        """,
+        (port.id, seal.watermark, after_event_id, limit + 1),
+    ).fetchall()
+    has_more = len(rows) > limit
+    return {
+        "port_id": port.id,
+        "seal": seal.as_dict(),
+        "cursor": seal.changes_cursor,
+        "count": min(len(rows), limit),
+        "has_more": has_more,
+        "events": [_event_dict(row) for row in rows[:limit]],
+    }
+
+
 def ingest(
     conn: sqlite3.Connection,
     *,
@@ -403,19 +712,39 @@ def ingest(
                         "different content"
                     ),
                 )
+            # Replay returns the stored outcome even if a later seal would now
+            # reject the same points: the batch was already accepted.
             return _batch_response(conn, previous["id"]), True
+
+        seal = latest_seal(conn, port_id=port.id)
+        latest_point_time = max((row.event_time for row in rows), default=None)
+        touched_vessels: set[str] = set()
+        frozen_before: dict[int, tuple[Any, ...]] | None = None
+        if seal is not None:
+            _check_sealed_points(
+                conn, port_id=port.id, watermark=seal.watermark, rows=rows
+            )
+            # Snapshot only the vessels this batch can reconcile.
+            touched_vessels = {row.vessel_id for row in rows}
+            frozen_before = _frozen_events(
+                conn,
+                port_id=port.id,
+                watermark=seal.watermark,
+                vessel_ids=touched_vessels,
+            )
 
         created_at = utc_now_iso()
         batch_cursor = conn.execute(
             """
             INSERT INTO ingest_batches
                 (port_id, upload_key, content_sha256, rows_received, rows_new,
-                 rows_duplicate, rows_outside_port, received_at)
-            VALUES (?, ?, ?, ?, 0, 0, 0, ?)
+                 rows_duplicate, rows_outside_port, received_at,
+                 latest_point_time)
+            VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?)
             """,
             (port.id, upload_key, content_sha,
              rows_received if rows_received is not None else len(rows),
-             created_at),
+             created_at, latest_point_time),
         )
         batch_id = int(batch_cursor.lastrowid)
 
@@ -498,6 +827,15 @@ def ingest(
                     existing=existing_events[vessel_id],
                     created_at=created_at,
                 )
+
+        if frozen_before is not None:
+            _assert_frozen_events_unchanged(
+                conn,
+                port_id=port.id,
+                watermark=seal.watermark,
+                vessel_ids=touched_vessels,
+                before=frozen_before,
+            )
 
         return _batch_response(conn, batch_id), False
 
